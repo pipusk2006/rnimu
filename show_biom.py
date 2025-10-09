@@ -6,7 +6,7 @@ import pandas as pd
 import numpy as np
 import os
 
-PATH = "code/biom_data/forest/forest_1.biom"   # поправь путь при необходимости
+PATH = "biom_data/tropical_rainforest/tropical_rainforest_2.biom"   # поправь путь при необходимости
 
 def load_biom(path):
     if not os.path.exists(path):

@@ -1,178 +1,219 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os, time, sys, re
-import requests
+import os, sys, time, shutil, subprocess
 from urllib.parse import quote
+import requests
 
 BASE = "https://www.ebi.ac.uk/metagenomics/api/v1"
 OUT_DIR = "biom_data"
-os.makedirs(OUT_DIR, exist_ok=True)
-
-# 5 целевых почвенных классов → lineage в MGnify
-BIOMES = {
-    "forest":       "root:Environmental:Terrestrial:Soil:Forest soil",
-    "wetland":      "root:Environmental:Terrestrial:Soil:Wetlands",
-    "grassland":    "root:Environmental:Terrestrial:Soil:Grasslands",
-    "desert":       "root:Environmental:Terrestrial:Soil:Desert",
-    "agricultural": "root:Environmental:Terrestrial:Soil:Agricultural",
-}
-
 TARGET_PER_CLASS = 100
-REQ_TIMEOUT = 30
-SLEEP = 0.2  # небольшой бэкофф, чтобы не душить API
+REQ_TIMEOUT = 60
+SLEEP = 0.05
+MAX_SAMPLE_PAGES     = 120
+MAX_RUNS_PER_SAMPLE  = 12
+MAX_ANALYSES_PER_RUN = 12
+CLASS_TIME_LIMIT     = 20*60*10  # None чтобы снять лимит
+
+BIOMES = {
+    "contaminated": "root:Environmental:Terrestrial:Soil:Contaminated",
+    "grassland":    "root:Environmental:Terrestrial:Soil:Grasslands",
+}
 
 session = requests.Session()
 session.headers.update({"Accept": "application/json"})
+os.makedirs(OUT_DIR, exist_ok=True)
 
-def get_json(url, params=None):
-    for attempt in range(5):
+def get_json(url, params=None, retries=5):
+    for a in range(retries):
         try:
             r = session.get(url, params=params, timeout=REQ_TIMEOUT)
             if r.status_code == 429:
-                # rate limit – подождать подольше
-                time.sleep(3 + attempt)
-                continue
+                time.sleep(3 + a); continue
             r.raise_for_status()
             return r.json()
         except Exception as e:
-            if attempt == 4:
-                raise
-            time.sleep(1 + attempt)
-    return None
+            if a == retries - 1: raise
+            time.sleep(1 + a)
 
 def iter_pages(url, params=None):
-    """Итерация по страницам JSON:API (links.next)."""
     while url:
         data = get_json(url, params=params)
-        if data is None: break
+        if not data: break
         yield data
-        links = data.get("links", {})
-        url = links.get("next")
-
-def pick_biom_download(downloads):
-    """Вернуть (url, alias) первого доступного .biom из списка downloads."""
-    for item in downloads.get("data", []):
-        attrs = item.get("attributes", {})
-        alias = attrs.get("alias", "")
-        # MGnify помечает BIOM так: *_OTU_TABLE_JSON.biom или *_HDF5.biom
-        if alias.lower().endswith(".biom"):
-            link = item.get("links", {}).get("self")
-            if link:
-                return link, alias
-    return None, None
+        url = (data.get("links") or {}).get("next")
 
 def ensure_unique_path(dirpath, base_name):
-    """forest_1.biom ... forest_100.biom, без перезаписи."""
     path = os.path.join(dirpath, base_name)
-    if not os.path.exists(path):
-        return path
-    # если вдруг имя занято, добавим суффикс
-    stem, ext = os.path.splitext(base_name)
-    i = 2
+    if not os.path.exists(path): return path
+    stem, ext = os.path.splitext(base_name); i = 2
     while True:
-        candidate = os.path.join(dirpath, f"{stem}__{i}{ext}")
-        if not os.path.exists(candidate):
-            return candidate
+        cand = os.path.join(dirpath, f"{stem}__{i}{ext}")
+        if not os.path.exists(cand): return cand
         i += 1
 
-def download_file(file_url, out_path):
-    for attempt in range(5):
+def download_file(file_url, out_path, retries=5):
+    for a in range(retries):
         try:
             with session.get(file_url, stream=True, timeout=REQ_TIMEOUT) as r:
                 if r.status_code == 429:
-                    time.sleep(3 + attempt)
-                    continue
+                    time.sleep(3 + a); continue
                 r.raise_for_status()
                 with open(out_path, "wb") as f:
-                    for chunk in r.iter_content(chunk_size=1048576):
-                        if chunk:
-                            f.write(chunk)
+                    for chunk in r.iter_content(1048576):
+                        if chunk: f.write(chunk)
             return True
         except Exception as e:
-            if attempt == 4:
+            if a == retries - 1:
                 print(f"[!] FAIL {file_url} -> {out_path}: {e}", file=sys.stderr)
                 return False
-            time.sleep(1 + attempt)
-    return False
+            time.sleep(1 + a)
 
-def harvest_for_biome(class_name, lineage, n_target=TARGET_PER_CLASS):
+def find_biom_or_tsv(downloads_json):
+    """
+    FIX: Брать только реальные ссылки из downloads.
+    Возвращает (biom_url, biom_alias, tsv_url, tsv_alias).
+    """
+    biom_url = biom_alias = tsv_url = tsv_alias = None
+    for item in (downloads_json.get("data") or []):
+        attrs = item.get("attributes") or {}
+        alias = (attrs.get("alias") or "").strip()
+        link  = (item.get("links") or {}).get("self")
+        if not alias or not link:
+            continue
+        low = alias.lower()
+        if low.endswith(".biom"):
+            biom_url, biom_alias = link, alias
+            break  # приоритет .biom
+        # запасной вариант: любые OTU-таблицы в TSV
+        if "otu" in low and low.endswith(".tsv") and tsv_url is None:
+            tsv_url, tsv_alias = link, alias
+    return biom_url, biom_alias, tsv_url, tsv_alias
+
+def locate_biom_cli():
+    cli = shutil.which("biom")
+    if cli: return cli
+    guess = os.path.join(sys.exec_prefix, "Scripts", "biom.exe")
+    return guess if os.path.exists(guess) else None
+
+def convert_tsv_to_biom(tsv_path, biom_out_path):
+    biom_cli = locate_biom_cli()
+    if biom_cli:
+        cmd = [biom_cli, "convert", "-i", tsv_path, "-o", biom_out_path,
+               "--table-type=OTU table", "--to-hdf5"]
+        subprocess.check_call(cmd)
+        return True
+    # python fallback
+    try:
+        import pandas as pd
+        from biom.table import Table
+        df = pd.read_csv(tsv_path, sep="\t", index_col=0)
+        table = Table(df.values,
+                      observation_ids=list(df.index.astype(str)),
+                      sample_ids=list(df.columns.astype(str)))
+        table.to_hdf5(biom_out_path, generated_by="mgnify-collector")
+        return True
+    except Exception as e:
+        print(f"[!] TSV→BIOM fallback не удался: {e}", file=sys.stderr)
+        return False
+
+def harvest_class(class_name, lineage, n_target=TARGET_PER_CLASS):
     print(f"\n=== {class_name.upper()} ===")
-    saved = 0
+    start_ts = time.time(); saved = 0
+    class_dir = os.path.join(OUT_DIR, class_name); os.makedirs(class_dir, exist_ok=True)
     page_url = f"{BASE}/biomes/{quote(lineage, safe='')}/samples"
 
-    # Папка для класса
-    class_dir = os.path.join(OUT_DIR, class_name)
-    os.makedirs(class_dir, exist_ok=True)
-
-    # Перебираем все sample-ы данного биома
+    page_i = 0
     for page in iter_pages(page_url):
-        for samp in page.get("data", []):
-            if saved >= n_target:
-                break
+        page_i += 1
+        print(f"[{class_name}] page={page_i} saved={saved}")
+        if saved >= n_target: break
+        if CLASS_TIME_LIMIT and (time.time() - start_ts > CLASS_TIME_LIMIT):
+            print(f"[{class_name}] Достигнут лимит времени."); break
+        if page_i > MAX_SAMPLE_PAGES:
+            print(f"[{class_name}] Достигнут лимит страниц samples."); break
 
-            sid = samp.get("id")  # sample accession (e.g. SRS..., ERS...)
-            runs_link = samp.get("relationships", {}).get("runs", {}).get("links", {}).get("related")
-            if not runs_link:
-                continue
+        for samp in (page.get("data") or []):
+            if saved >= n_target: break
+            runs_link = (((samp.get("relationships") or {}).get("runs") or {}).get("links") or {}).get("related")
+            if not runs_link: continue
+            runs = get_json(runs_link) or {}
+            run_cnt = 0
 
-            # Просматриваем все runs этого sample (лучше брать amplicon – там BIOM точно есть)
-            runs = get_json(runs_link)
-            for run in runs.get("data", []):
-                if saved >= n_target:
-                    break
+            for run in (runs.get("data") or []):
+                run_cnt += 1
+                if run_cnt > MAX_RUNS_PER_SAMPLE: break
+                if saved >= n_target: break
 
-                exp_type = run.get("attributes", {}).get("experiment-type", "")
-                # Приоритет ампликонных данных (SSU/ITS/LSU) – там всегда есть OTU BIOM
-                if exp_type not in ("amplicon", "SSU", "ITS", "LSU"):
-                    continue
+                analyses_link = (((run.get("relationships") or {}).get("analyses") or {}).get("links") or {}).get("related")
+                if not analyses_link: continue
+                analyses = get_json(analyses_link) or {}
+                an_cnt = 0
 
-                analyses_link = run.get("relationships", {}).get("analyses", {}).get("links", {}).get("related")
-                if not analyses_link:
-                    continue
+                for an in (analyses.get("data") or []):
+                    an_cnt += 1
+                    if an_cnt > MAX_ANALYSES_PER_RUN: break
+                    if saved >= n_target: break
 
-                analyses = get_json(analyses_link)
-                for an in analyses.get("data", []):
-                    if saved >= n_target:
-                        break
-                    an_id = an.get("id")
-                    dl_link = an.get("relationships", {}).get("downloads", {}).get("links", {}).get("related")
-                    if not dl_link:
+                    dl_link = (((an.get("relationships") or {}).get("downloads") or {}).get("links") or {}).get("related")
+                    if not dl_link: continue
+
+                    downloads = get_json(dl_link) or {}
+                    biom_url, biom_alias, tsv_url, tsv_alias = find_biom_or_tsv(downloads)
+
+                    # DEBUG/лог: что реально нашли
+                    if not biom_url and not tsv_url:
+                        print(f"[{class_name}] skip analysis {an.get('id')} — нет .biom и OTU .tsv")
                         continue
 
-                    downloads = get_json(dl_link)
-                    file_url, alias = pick_biom_download(downloads)
-                    if not file_url:
-                        continue
-
-                    # Имя по ТЗ: forest_1.biom, ...
-                    out_name = f"{class_name}_{saved+1}.biom"
-                    out_path = ensure_unique_path(class_dir, out_name)
-                    ok = download_file(file_url, out_path)
-                    if ok:
-                        saved += 1
-                        print(f"[{class_name}] {saved}/{n_target}: {out_name}")
+                    # 1) BIOM напрямую
+                    if biom_url:
+                        out_name = f"{class_name}_{saved+1}.biom"
+                        out_path = ensure_unique_path(class_dir, out_name)
+                        print(f"[{class_name}] download BIOM: {biom_alias} ← {biom_url}")
+                        if download_file(biom_url, out_path):
+                            saved += 1
+                            print(f"[{class_name}] {saved}/{n_target}: {os.path.basename(out_path)} (BIOM)")
                         time.sleep(SLEEP)
-                    if saved >= n_target:
-                        break
+                        if saved >= n_target: break
+                        continue
 
-            if saved >= n_target:
-                break
-
-        # маленькая пауза между страницами
-        time.sleep(SLEEP)
-
-    print(f"Итого для {class_name}: {saved} файлов.\n")
+                    # 2) OTU TSV → BIOM
+                    if tsv_url:
+                        tmp_tsv = os.path.join(class_dir, f"__tmp_{class_name}_{saved+1}.tsv")
+                        out_name = f"{class_name}_{saved+1}.biom"
+                        out_path = ensure_unique_path(class_dir, out_name)
+                        print(f"[{class_name}] download TSV:  {tsv_alias} ← {tsv_url}")
+                        if download_file(tsv_url, tmp_tsv):
+                            try:
+                                if convert_tsv_to_biom(tmp_tsv, out_path):
+                                    saved += 1
+                                    print(f"[{class_name}] {saved}/{n_target}: {os.path.basename(out_path)} (from TSV)")
+                            finally:
+                                try: os.remove(tmp_tsv)
+                                except OSError: pass
+                            time.sleep(SLEEP)
+                            if saved >= n_target: break
+                        continue
+        # конец страницы
+    print(f"Итого для {class_name}: {saved} файлов.")
     return saved
 
 def main():
     total = 0
     for cname, lineage in BIOMES.items():
         try:
-            total += harvest_for_biome(cname, lineage, TARGET_PER_CLASS)
+            total += harvest_class(cname, lineage, TARGET_PER_CLASS)
+        except subprocess.CalledProcessError as e:
+            print(f"[!] Ошибка конвертации для {cname}: {e}", file=sys.stderr)
+        except KeyboardInterrupt:
+            print("\n[!] Прервано пользователем."); break
         except Exception as e:
             print(f"[!] Ошибка на классе {cname}: {e}", file=sys.stderr)
-    print(f"Готово. Всего скачано: {total} BIOM-файлов. См. папку: {OUT_DIR}")
+    print(f"\nГотово: всего скачано {total} BIOM-файлов. Папка: {OUT_DIR}")
 
 if __name__ == "__main__":
     main()
+
+
+
