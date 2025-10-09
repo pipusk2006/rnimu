@@ -7,17 +7,16 @@ import requests
 
 BASE = "https://www.ebi.ac.uk/metagenomics/api/v1"
 OUT_DIR = "biom_data"
-TARGET_PER_CLASS = 100
+TARGET_PER_CLASS = 200
 REQ_TIMEOUT = 60
 SLEEP = 0.05
 MAX_SAMPLE_PAGES     = 120
 MAX_RUNS_PER_SAMPLE  = 12
 MAX_ANALYSES_PER_RUN = 12
-CLASS_TIME_LIMIT     = 20*60*10  # None чтобы снять лимит
+CLASS_TIME_LIMIT     = None  # None чтобы снять лимит
 
 BIOMES = {
-    "contaminated": "root:Environmental:Terrestrial:Soil:Contaminated",
-    "grassland":    "root:Environmental:Terrestrial:Soil:Grasslands",
+    "forest":       "root:Environmental:Terrestrial:Soil:Forest soil",
 }
 
 session = requests.Session()
